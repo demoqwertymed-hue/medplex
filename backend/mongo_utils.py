@@ -13,11 +13,10 @@ db = client[MONGODB_DB_NAME]
 devices_collection = db["devices"]
 manufacturers_collection = db["manufacturers"]
 users_collection = db["users"]
-feedback_collection = db["feedback"]
 
 def init_mongo_connection():
     """Initialize MongoDB connection"""
-    global client, db, devices_collection, feedback_collection, manufacturers_collection, users_collection
+    global client, db, devices_collection, manufacturers_collection, users_collection
     
     try:
         client = MongoClient(
@@ -33,7 +32,6 @@ def init_mongo_connection():
         
         db = client[MONGODB_DB_NAME]
         devices_collection = db["devices"]
-        feedback_collection = db["feedback"]
         manufacturers_collection = db["manufacturers"]
         users_collection = db["users"]
         
@@ -57,11 +55,11 @@ init_mongo_connection()
 
 def get_mongo_collections():
     """Get MongoDB collections with connection check"""
-    if None in [client, db, devices_collection, feedback_collection]:
+    if None in [client, db, devices_collection]:
         if not init_mongo_connection():
             raise Exception("MongoDB connection not available")
     
-    return devices_collection, feedback_collection
+    return devices_collection, manufacturers_collection, users_collection
 
 def store_device_risk_data(device_data: dict):
     """
@@ -76,17 +74,21 @@ def update_device_risk_data(device_id: str, update_data: dict):
     Update device risk data
     """
     try:
+        # Convert string device_id to ObjectId
+        query_id = ObjectId(device_id)
+            
         result = devices_collection.update_one(
-            {"_id": ObjectId(device_id)},
+            {"_id": query_id},
             {"$set": update_data}
         )
         return result.modified_count > 0
-    except:
+    except Exception as e:
+        print(f"Error updating device: {e}")
         return False
 
 def query_similar_devices(device_name: str, manufacturer_name: str, n_results: int = 5):
     """Query similar devices from MongoDB using text search"""
-    devices_coll, _ = get_mongo_collections()
+    devices_coll, _, _ = get_mongo_collections()
     
     # Search for similar devices
     results = devices_coll.find(
@@ -121,10 +123,6 @@ def get_all_devices():
     # Convert ObjectId to string for JSON serialization
     for device in devices:
         device["_id"] = str(device["_id"])
-        if "feedback" in device:
-            for feedback in device["feedback"]:
-                if "_id" in feedback:
-                    feedback["_id"] = str(feedback["_id"])
     return devices
 
 def get_devices_by_manufacturer(manufacturer_name: str):
@@ -141,28 +139,15 @@ def get_devices_by_username(username: str):
     Get devices by username (for manufacturer dashboard)
     """
     # First get manufacturer details to get company name
-    manufacturer = manufacturers_collection.find_one({"username": username})
+    manufacturer = manufacturers_collection.find_one({"email": username})
     if manufacturer:
-        company_name = manufacturer.get("company_name", "")
+        manufacturer_name = manufacturer.get("manufacturer_name", "")
         # Get devices by manufacturer name
-        devices = list(devices_collection.find({"manufacturer_name": company_name}))
+        devices = list(devices_collection.find({"manufacturer_name": manufacturer_name}))
         for device in devices:
             device["_id"] = str(device["_id"])
         return devices
     return []
-
-def add_feedback_to_device(device_id: str, feedback_data: dict):
-    """
-    Add feedback to an existing device document
-    """
-    try:
-        result = devices_collection.update_one(
-            {"_id": ObjectId(device_id)},
-            {"$push": {"feedback": feedback_data}}
-        )
-        return result.modified_count > 0
-    except:
-        return False
 
 def get_device_with_feedback(device_id: str):
     """
@@ -173,27 +158,6 @@ def get_device_with_feedback(device_id: str):
         return device
     except:
         return None
-
-def get_all_feedback():
-    """Get all feedback entries from MongoDB"""
-    _, feedback_coll = get_mongo_collections()
-    
-    feedback_entries = []
-    for feedback in feedback_coll.find():
-        feedback_info = {
-            "id": feedback["_id"],
-            "device_name": feedback["device_name"],
-            "manufacturer_name": feedback["manufacturer_name"],
-            "user_rating": feedback["user_rating"],
-            "user_feedback": feedback["user_feedback"],
-            "predicted_risk": feedback["predicted_risk"],
-            "actual_risk": feedback.get("actual_risk", ""),
-            "username": feedback.get("username", "unknown"),
-            "created_at": feedback.get("created_at", "")
-        }
-        feedback_entries.append(feedback_info)
-    
-    return feedback_entries
 
 def get_dashboard_stats(manufacturer_name: str = None):
     """
@@ -227,3 +191,81 @@ def get_dashboard_stats(manufacturer_name: str = None):
         "risk_distribution": risk_dist_dict,
         "recent_devices": recent_devices
     }
+def add_feedback_to_device(device_id: str, feedback_data: dict):
+    """
+    Add feedback to a device
+    """
+    try:
+        result = devices_collection.update_one(
+            {"_id": ObjectId(device_id)},
+            {"$push": {"feedback": feedback_data}}
+        )
+        return result.modified_count > 0
+    except:
+        return False
+def get_all_feedback():
+    """
+    Get all feedback from all devices
+    """
+    devices = list(devices_collection.find({"feedback": {"$exists": True, "$ne": []}}))
+    feedback_list = []
+    
+    for device in devices:
+        device_id = str(device["_id"])
+        for feedback in device.get("feedback", []):
+            feedback["device_id"] = device_id
+            feedback["device_name"] = device.get("device_name", "")
+            feedback["manufacturer_name"] = device.get("manufacturer_name", "")
+            feedback_list.append(feedback)
+    
+    return feedback_list
+
+def store_failure_report(failure_data: dict):
+    """
+    Store device failure report in a separate collection
+    """
+    failure_collection = db["failure_reports"]
+    failure_data["created_at"] = datetime.now().isoformat()
+    failure_data["report_id"] = str(uuid.uuid4())
+    result = failure_collection.insert_one(failure_data)
+    return str(result.inserted_id)
+
+# Add this to mongo_utils.py
+def get_failure_reports_collection():
+    """Get failure reports collection"""
+    return db["failure_reports"]
+
+def store_failure_report(failure_data: dict):
+    """
+    Store device failure report in a separate collection
+    """
+    failure_collection = get_failure_reports_collection()
+    failure_data["created_at"] = datetime.now().isoformat()
+    failure_data["report_id"] = str(uuid.uuid4())
+    result = failure_collection.insert_one(failure_data)
+    return str(result.inserted_id)
+
+def get_failure_reports_by_manufacturer(manufacturer_name: str):
+    """
+    Get all failure reports for a specific manufacturer
+    """
+    failure_collection = get_failure_reports_collection()
+    reports = list(failure_collection.find({"manufacturer_name": manufacturer_name}))
+    
+    # Convert ObjectId to string for JSON serialization
+    for report in reports:
+        report["_id"] = str(report["_id"])
+    
+    return reports
+
+def get_all_failure_reports():
+    """
+    Get all failure reports (for admin/super admin)
+    """
+    failure_collection = get_failure_reports_collection()
+    reports = list(failure_collection.find())
+    
+    for report in reports:
+        report["_id"] = str(report["_id"])
+    
+    return reports

@@ -1,4 +1,4 @@
-# auth.py - Updated with Super Admin functionality
+# auth.py - Updated with Super Admin functionality and new authentication system
 from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
@@ -41,15 +41,17 @@ def init_super_admin():
         print("Super admin user created")
 
 # User model (MongoDB document)
+
 class UserDB:
-    def __init__(self, username: str, email: str, hashed_password: str, 
+    def __init__(self, email: str, hashed_password: str, username: Optional[str] = None, 
                  is_active: bool = True, role: str = "user", **kwargs):
-        self.username = username
+        # Use email as username if username is not provided
+        self.username = username or email
         self.email = email
         self.hashed_password = hashed_password
         self.is_active = is_active
         self.role = role
-    
+
     def to_dict(self):
         return {
             "username": self.username,
@@ -79,35 +81,62 @@ def get_user(username: str):
         return UserDB(**user_data_without_id)
     return None
 
-def get_manufacturer(username: str):
-    manufacturer_data = manufacturers_collection.find_one({"username": username})
+def get_user_by_email(email: str):
+    user_data = users_collection.find_one({"email": email})
+    if user_data:
+        user_data_without_id = {k: v for k, v in user_data.items() if k != '_id'}
+        return UserDB(**user_data_without_id)
+    return None
+
+def get_manufacturer(email: str):
+    manufacturer_data = manufacturers_collection.find_one({"email": email})
     if manufacturer_data:
         return {
-            "username": manufacturer_data["username"],
             "email": manufacturer_data["email"],
-            "company_name": manufacturer_data["company_name"],
+            "manufacturer_name": manufacturer_data.get("manufacturer_name", ""),  # Use get with default
+            "hashed_password": manufacturer_data["hashed_password"],
             "is_active": manufacturer_data.get("is_active", True),
             "role": "manufacturer"
         }
     return None
 
-def authenticate_user(username: str, password: str):
-    user = get_user(username)
+def authenticate_user(email: str, password: str):
+    user = get_user_by_email(email)
     if not user:
-        # Check if it's a manufacturer
-        manufacturer = get_manufacturer(username)
-        if manufacturer and verify_password(password, manufacturer.get("hashed_password", "")):
-            return UserDB(
-                username=manufacturer["username"],
-                email=manufacturer["email"],
-                hashed_password=manufacturer["hashed_password"],
-                is_active=manufacturer["is_active"],
-                role="manufacturer"
-            )
         return False
+    
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account not activated by Superadmin"
+        )
+    
     if not verify_password(password, user.hashed_password):
         return False
     return user
+
+def authenticate_manufacturer(email: str, password: str):
+    manufacturer = get_manufacturer(email)
+    if not manufacturer:
+        return False
+    
+    if not manufacturer.get("is_active", True):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account not activated by Superadmin"
+        )
+    
+    if not verify_password(password, manufacturer["hashed_password"]):
+        return False
+    
+    # Create UserDB object for compatibility
+    return UserDB(
+        email=manufacturer["email"],
+        hashed_password=manufacturer["hashed_password"],
+        username=manufacturer["email"],  # Using email as username
+        is_active=manufacturer.get("is_active", True),
+        role=manufacturer.get("role", "manufacturer")
+    )
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -119,8 +148,6 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-# In auth.py, update the get_current_user function around line 147
-
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -130,34 +157,43 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
+        email: str = payload.get("sub")
         role: str = payload.get("role", "user")
-        if username is None:
+        if email is None:
             raise credentials_exception
-        token_data = TokenData(username=username, role=role)
+        token_data = TokenData(username=email, role=role)
     except JWTError:
         raise credentials_exception
         
     # Check both regular users and manufacturers collections
-    user = get_user(username=token_data.username)
+    user = get_user_by_email(email=token_data.username)
     if user is None:
-        manufacturer = get_manufacturer(username=token_data.username)
+        manufacturer = get_manufacturer(email=token_data.username)
         if manufacturer:
-            # FIX: Check if hashed_password exists before accessing it
-            hashed_password = manufacturer.get("hashed_password", "")
             user = UserDB(
-                username=manufacturer["username"],
                 email=manufacturer["email"],
-                hashed_password=hashed_password,
+                hashed_password=manufacturer["hashed_password"],
+                username=manufacturer["email"],
                 is_active=manufacturer.get("is_active", True),
                 role=manufacturer.get("role", "manufacturer")
             )
     
     if user is None or not user.is_active:
         raise credentials_exception
+    if user is None:
+        manufacturer = get_manufacturer(email=token_data.username)
+        if manufacturer:
+            user = UserDB(
+                email=manufacturer["email"],
+                hashed_password=manufacturer.get("hashed_password", ""),  # Use get with default
+                username=manufacturer["email"],
+                is_active=manufacturer.get("is_active", True),
+                role=manufacturer.get("role", "manufacturer")
+            )
     
     user.role = role
     return user
+
 def get_super_admin_user(current_user: UserDB = Depends(get_current_user)):
     """Dependency to ensure user is a super admin"""
     if current_user.role != "super_admin":
@@ -167,27 +203,22 @@ def get_super_admin_user(current_user: UserDB = Depends(get_current_user)):
         )
     return current_user
 
-def create_manufacturer_user(username: str, email: str, password: str, company_name: str):
+def create_manufacturer_user(manufacturer_name: str, email: str, password: str):
     """
     Create a manufacturer user with separate storage
     """
     # Check if user already exists
-    existing_user = manufacturers_collection.find_one({"username": username})
+    existing_user = manufacturers_collection.find_one({"email": email})
     if existing_user:
-        return False, "Username already exists"
-    
-    existing_email = manufacturers_collection.find_one({"email": email})
-    if existing_email:
         return False, "Email already registered"
     
     # Create manufacturer user
     hashed_password = get_password_hash(password)
     manufacturer_data = {
-        "username": username,
+        "manufacturer_name": manufacturer_name,
         "email": email,
         "hashed_password": hashed_password,
-        "company_name": company_name,
-        "is_active": True,
+        "is_active": False,  # Default to inactive until activated by superadmin
         "role": "manufacturer",
         "created_at": datetime.now().isoformat()
     }
@@ -195,25 +226,6 @@ def create_manufacturer_user(username: str, email: str, password: str, company_n
     result = manufacturers_collection.insert_one(manufacturer_data)
     return True, str(result.inserted_id)
 
-def authenticate_manufacturer(username: str, password: str):
-    """
-    Authenticate manufacturer user
-    """
-    manufacturer_data = manufacturers_collection.find_one({"username": username})
-    if not manufacturer_data:
-        return False
-    
-    if not verify_password(password, manufacturer_data["hashed_password"]):
-        return False
-    
-    # Create UserDB object for compatibility
-    return UserDB(
-        username=manufacturer_data["username"],
-        email=manufacturer_data["email"],
-        hashed_password=manufacturer_data["hashed_password"],
-        is_active=manufacturer_data.get("is_active", True),
-        role=manufacturer_data.get("role", "manufacturer")
-    )
 
 # Initialize super admin on import
 init_super_admin()
